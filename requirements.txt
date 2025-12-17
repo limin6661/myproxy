@@ -1,3 +1,4 @@
 flask
 curl_cffi
 gevent
+gunicorn[gevent]
