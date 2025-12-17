@@ -1,0 +1,3 @@
+flask
+curl_cffi
+gevent
