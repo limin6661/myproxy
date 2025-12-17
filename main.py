@@ -1,8 +1,10 @@
 from flask import Flask, request, Response, stream_with_context
 from curl_cffi import requests
 import json
-import time
 import os
+import time
+import threading
+import queue
 
 app = Flask(__name__)
 
@@ -26,66 +28,146 @@ BASE_HEADERS = {
     "Content-Type": "application/json",
 }
 
-@app.route('/', methods=['GET'])
+# ================= 通用 CORS（避免 Zeabur/浏览器端跨域麻烦）=================
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS, GET"
+    return resp
+
+@app.route("/", methods=["GET"])
 def index():
     return "Kimi Proxy is Running!"
 
-@app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
+@app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def proxy_handler():
-    if request.method == 'OPTIONS':
-        return Response(status=204, headers={'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*'})
+    if request.method == "OPTIONS":
+        return Response(status=204)
 
-    client_auth = request.headers.get('Authorization')
+    client_auth = request.headers.get("Authorization")
     if not client_auth:
-        return json.dumps({"error": "Missing API Key"}), 401
+        return Response(
+            json.dumps({"error": "Missing API Key"}, ensure_ascii=False),
+            status=401,
+            mimetype="application/json",
+        )
 
     try:
-        client_data = request.json
+        client_data = request.get_json(force=True, silent=False)
+        if not isinstance(client_data, dict):
+            raise ValueError("JSON must be an object")
         messages = client_data.get("messages", [])
-        client_model_name = client_data.get("model", "kimi").lower()
-    except:
-        return "Invalid JSON", 400
+        client_model_name = str(client_data.get("model", "kimi")).lower()
+    except Exception:
+        return Response(
+            json.dumps({"error": "Invalid JSON"}, ensure_ascii=False),
+            status=400,
+            mimetype="application/json",
+        )
 
     upstream_headers = BASE_HEADERS.copy()
-    upstream_headers['Authorization'] = client_auth
+    upstream_headers["Authorization"] = client_auth
 
     request_payload = {
         "model": "kimi-for-coding",
         "messages": messages,
         "stream": True,
         "max_tokens": client_data.get("max_tokens", 200000),
-        "temperature": client_data.get("temperature", 0.7)
+        "temperature": client_data.get("temperature", 0.7),
     }
 
     if "think" in client_model_name or "reason" in client_model_name:
         request_payload["reasoning_effort"] = "high"
         request_payload["temperature"] = 1.0
 
+    def sse_data(obj) -> bytes:
+        return (f"data: {json.dumps(obj, ensure_ascii=False)}\n\n").encode("utf-8")
+
     def generate_stream():
+        """
+        关键点：
+        1) 不去 decode/strip/过滤上游 chunk，避免“半截 SSE”被你切碎导致丢内容
+        2) 先立刻吐一个 SSE 注释行，保证很快有响应
+        3) 用队列 + 心跳，防止长时间没输出导致链路中间层把连接当成“卡死”
+        """
+        q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=2000)
+        stop_event = threading.Event()
+
+        def upstream_worker():
+            try:
+                with requests.Session() as session:
+                    resp = session.post(
+                        TARGET_URL,
+                        headers=upstream_headers,
+                        json=request_payload,
+                        impersonate="chrome110",
+                        stream=True,
+                        timeout=3600,
+                    )
+
+                    if resp.status_code != 200:
+                        q.put(sse_data({"error": resp.text}))
+                        return
+
+                    # 用一个固定 chunk_size，避免 None 造成不可控缓冲
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if stop_event.is_set():
+                            break
+                        if chunk:
+                            q.put(chunk)
+            except Exception as e:
+                q.put(sse_data({"error": str(e)}))
+            finally:
+                # 结束标记
+                try:
+                    q.put(None)
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=upstream_worker, daemon=True)
+        t.start()
+
+        # 先吐一口，立刻建立 SSE
+        yield b": connected\n\n"
+
+        heartbeat_sec = 15  # 心跳间隔（SSE 注释行，客户端会忽略）
         try:
-            with requests.Session() as session:
-                resp = session.post(
-                    TARGET_URL,
-                    headers=upstream_headers,
-                    json=request_payload,
-                    impersonate="chrome110", 
-                    stream=True,
-                    timeout=3600
-                )
-                
-                if resp.status_code != 200:
-                    yield f"data: {json.dumps({'error': resp.text})}\n\n"
-                    return
+            while True:
+                try:
+                    item = q.get(timeout=heartbeat_sec)
+                except queue.Empty:
+                    yield b": keep-alive\n\n"
+                    continue
 
-                for chunk in resp.iter_content(chunk_size=None):
-                    if chunk:
-                        yield chunk
+                if item is None:
+                    break
 
+                # 上游是 bytes，就原样转发
+                yield item
+        except GeneratorExit:
+            # 客户端断开
+            stop_event.set()
+            raise
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            stop_event.set()
+            yield sse_data({"error": str(e)})
+        finally:
+            stop_event.set()
 
-    return Response(stream_with_context(generate_stream()), content_type='text/event-stream')
+    response_headers = {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        # 如果前面有代理层，这个头能减少“缓冲导致不流式”的概率
+        "X-Accel-Buffering": "no",
+    }
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port)
+    return Response(
+        stream_with_context(generate_stream()),
+        headers=response_headers,
+    )
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
