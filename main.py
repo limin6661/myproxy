@@ -28,8 +28,8 @@ BASE_HEADERS = {
     "Content-Type": "application/json",
     "Accept-Language": "*",
     "Sec-Fetch-Mode": "cors",
-    "Accept-Encoding": "gzip, deflate"
-    "Content-Length": "146543"
+    "Accept-Encoding": "gzip, deflate",
+    "Content-Length": ""
 }
 
 # ================= 通用 CORS（避免 Zeabur/浏览器端跨域麻烦）=================
@@ -77,10 +77,11 @@ def proxy_handler():
         "model": "kimi-for-coding",
         "messages": messages,
         "stream": True,
-        "stream_options": {"include_usage": true}
-        "max_tokens": client_data.get("max_tokens", 200000),
+        "stream_options": {"include_usage": true},
         "temperature": client_data.get("temperature", 0.7),
     }
+
+     # 先不运行，弄出来："max_tokens": client_data.get("max_tokens", 200000),
 
     if "think" in client_model_name or "reason" in client_model_name:
         request_payload["reasoning_effort"] = "high"
