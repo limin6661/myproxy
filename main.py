@@ -40,11 +40,11 @@ def pick_max_tokens(client_data: dict) -> int:
         or client_data.get("max_new_tokens")
     )
     if v is None:
-        return int(os.environ.get("DEFAULT_MAX_TOKENS", "8192"))
+        return int(os.environ.get("DEFAULT_MAX_TOKENS", "200000"))
     try:
         return int(v)
     except Exception:
-        return int(os.environ.get("DEFAULT_MAX_TOKENS", "8192"))
+        return int(os.environ.get("DEFAULT_MAX_TOKENS", "200000"))
 
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def proxy_handler():
