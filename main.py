@@ -12,7 +12,7 @@ app = Flask(__name__)
 TARGET_URL = "https://api.kimi.com/coding/v1/chat/completions"
 
 BASE_HEADERS = {
-    "Host": "api.kimi.com",
+    "Host": "127.0.0.1:5000",
     "Connection": "keep-alive",
     "Accept": "application/json",
     "X-Stainless-Retry-Count": "0",
@@ -26,6 +26,10 @@ BASE_HEADERS = {
     "X-Title": "Roo Code",
     "User-Agent": "RooCode/3.36.6",
     "Content-Type": "application/json",
+    "Accept-Language": "*",
+    "Sec-Fetch-Mode": "cors",
+    "Accept-Encoding": "gzip, deflate"
+    "Content-Length": "146543"
 }
 
 # ================= 通用 CORS（避免 Zeabur/浏览器端跨域麻烦）=================
@@ -73,13 +77,14 @@ def proxy_handler():
         "model": "kimi-for-coding",
         "messages": messages,
         "stream": True,
+        "stream_options": {"include_usage": true}
         "max_tokens": client_data.get("max_tokens", 200000),
         "temperature": client_data.get("temperature", 0.7),
     }
 
     if "think" in client_model_name or "reason" in client_model_name:
         request_payload["reasoning_effort"] = "high"
-        request_payload["temperature"] = 1.0
+        request_payload["temperature"] = 0
 
     def sse_data(obj) -> bytes:
         return (f"data: {json.dumps(obj, ensure_ascii=False)}\n\n").encode("utf-8")
