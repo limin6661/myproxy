@@ -53,7 +53,7 @@ def proxy_handler():
         "model": "kimi-for-coding",
         "messages": messages,
         "stream": True,
-        "max_tokens": client_data.get("max_tokens", 32000),
+        "max_tokens": client_data.get("max_tokens", 200000),
         "temperature": client_data.get("temperature", 0.7)
     }
 
