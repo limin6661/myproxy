@@ -70,7 +70,7 @@ def proxy_handler():
                     json=request_payload,
                     impersonate="chrome110", 
                     stream=True,
-                    timeout=120
+                    timeout=3600
                 )
                 
                 if resp.status_code != 200:
