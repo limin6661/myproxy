@@ -2,7 +2,6 @@ from flask import Flask, request, Response, stream_with_context
 from curl_cffi import requests
 import json
 import os
-import time
 import threading
 import queue
 
@@ -12,9 +11,15 @@ app = Flask(__name__)
 TARGET_URL = "https://api.kimi.com/coding/v1/chat/completions"
 
 BASE_HEADERS = {
-    "Host": "127.0.0.1:5000",
     "Connection": "keep-alive",
     "Accept": "application/json",
+    "Content-Type": "application/json",
+    "User-Agent": "RooCode/3.36.6",
+    "Http-Referer": "https://github.com/RooVetGit/Roo-Cline",
+    "X-Title": "Roo Code",
+    "Accept-Encoding": "identity",
+    "Accept-Language": "*",
+    "Sec-Fetch-Mode": "cors",
     "X-Stainless-Retry-Count": "0",
     "X-Stainless-Lang": "js",
     "X-Stainless-Package-Version": "5.12.2",
@@ -22,17 +27,9 @@ BASE_HEADERS = {
     "X-Stainless-Arch": "x64",
     "X-Stainless-Runtime": "node",
     "X-Stainless-Runtime-Version": "v22.21.1",
-    "Http-Referer": "https://github.com/RooVetGit/Roo-Cline",
-    "X-Title": "Roo Code",
-    "User-Agent": "RooCode/3.36.6",
-    "Content-Type": "application/json",
-    "Accept-Language": "*",
-    "Sec-Fetch-Mode": "cors",
-    "Accept-Encoding": "gzip, deflate",
-    "Content-Length": ""
 }
 
-# ================= 通用 CORS（避免 Zeabur/浏览器端跨域麻烦）=================
+# ================= 通用 CORS =================
 @app.after_request
 def add_cors_headers(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -77,27 +74,20 @@ def proxy_handler():
         "model": "kimi-for-coding",
         "messages": messages,
         "stream": True,
-        "stream_options": {"include_usage": true},
-        "temperature": client_data.get("temperature", 0.7),
+        "stream_options": {"include_usage": True},
+        "max_tokens": int(client_data.get("max_tokens", 200000)),
+        "temperature": float(client_data.get("temperature", 0.7)),
     }
-
-     # 先不运行，弄出来："max_tokens": client_data.get("max_tokens", 200000),
 
     if "think" in client_model_name or "reason" in client_model_name:
         request_payload["reasoning_effort"] = "high"
-        request_payload["temperature"] = 0
+        request_payload["temperature"] = 1.0
 
     def sse_data(obj) -> bytes:
         return (f"data: {json.dumps(obj, ensure_ascii=False)}\n\n").encode("utf-8")
 
     def generate_stream():
-        """
-        关键点：
-        1) 不去 decode/strip/过滤上游 chunk，避免“半截 SSE”被你切碎导致丢内容
-        2) 先立刻吐一个 SSE 注释行，保证很快有响应
-        3) 用队列 + 心跳，防止长时间没输出导致链路中间层把连接当成“卡死”
-        """
-        q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=2000)
+        q = queue.Queue(maxsize=2000)
         stop_event = threading.Event()
 
         def upstream_worker():
@@ -116,28 +106,25 @@ def proxy_handler():
                         q.put(sse_data({"error": resp.text}))
                         return
 
-                    # 用一个固定 chunk_size，避免 None 造成不可控缓冲
                     for chunk in resp.iter_content(chunk_size=8192):
                         if stop_event.is_set():
                             break
                         if chunk:
                             q.put(chunk)
+
             except Exception as e:
                 q.put(sse_data({"error": str(e)}))
             finally:
-                # 结束标记
                 try:
                     q.put(None)
                 except Exception:
                     pass
 
-        t = threading.Thread(target=upstream_worker, daemon=True)
-        t.start()
+        threading.Thread(target=upstream_worker, daemon=True).start()
 
-        # 先吐一口，立刻建立 SSE
         yield b": connected\n\n"
 
-        heartbeat_sec = 15  # 心跳间隔（SSE 注释行，客户端会忽略）
+        heartbeat_sec = 15
         try:
             while True:
                 try:
@@ -149,10 +136,9 @@ def proxy_handler():
                 if item is None:
                     break
 
-                # 上游是 bytes，就原样转发
                 yield item
+
         except GeneratorExit:
-            # 客户端断开
             stop_event.set()
             raise
         except Exception as e:
@@ -165,14 +151,10 @@ def proxy_handler():
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        # 如果前面有代理层，这个头能减少“缓冲导致不流式”的概率
         "X-Accel-Buffering": "no",
     }
 
-    return Response(
-        stream_with_context(generate_stream()),
-        headers=response_headers,
-    )
+    return Response(stream_with_context(generate_stream()), headers=response_headers)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
