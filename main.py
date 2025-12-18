@@ -2,6 +2,9 @@ from flask import Flask, request, Response, stream_with_context
 from curl_cffi import requests
 import json
 import os
+import time
+import threading
+import queue
 
 app = Flask(__name__)
 
@@ -27,12 +30,17 @@ BASE_HEADERS = {
     "Content-Type": "application/json",
 }
 
+# ===== 关键：心跳配置（可用环境变量覆盖）=====
+SSE_PING_INTERVAL = float(os.environ.get("SSE_PING_INTERVAL", "15"))  # 秒
+# 很多网关会缓冲“小包”，2KB+ 更容易被立刻刷出去
+SSE_PING_BYTES = int(os.environ.get("SSE_PING_BYTES", "2048"))
+STREAM_QUEUE_MAX = int(os.environ.get("STREAM_QUEUE_MAX", "256"))  # 防止断连后堆内存
+
 @app.route("/", methods=["GET"])
 def index():
     return "Kimi Proxy is Running!"
 
 def pick_max_tokens(client_data: dict) -> int:
-    # 兼容不同客户端字段名
     v = (
         client_data.get("max_tokens")
         or client_data.get("max_completion_tokens")
@@ -81,7 +89,6 @@ def proxy_handler():
         "max_tokens": pick_max_tokens(client_data),
     }
 
-    # 也可以顺手透传一些常见参数（可选，但更兼容）
     for k in ("top_p", "presence_penalty", "frequency_penalty", "stop", "seed", "n"):
         if k in client_data:
             request_payload[k] = client_data[k]
@@ -90,7 +97,21 @@ def proxy_handler():
         request_payload["reasoning_effort"] = "high"
         request_payload["temperature"] = 1.0
 
-    def generate_stream():
+    # ========= 核心改动开始：后台读上游 + 前台心跳 =========
+    stop_event = threading.Event()
+    q: queue.Queue[bytes] = queue.Queue(maxsize=STREAM_QUEUE_MAX)
+    END = b"__END__"
+
+    def put_blocking(data: bytes):
+        # 队列满就等，但要能响应 stop_event，避免断连后无限堆内存/卡死
+        while not stop_event.is_set():
+            try:
+                q.put(data, timeout=1)
+                return
+            except queue.Full:
+                continue
+
+    def upstream_reader():
         try:
             with requests.Session() as session:
                 resp = session.post(
@@ -103,25 +124,65 @@ def proxy_handler():
                 )
 
                 if resp.status_code != 200:
-                    yield f"data: {json.dumps({'error': resp.text})}\n\n".encode("utf-8")
+                    put_blocking(f"data: {json.dumps({'error': resp.text})}\n\n".encode("utf-8"))
                     return
 
-                # 用一个较小的 chunk_size，避免某些环境“攒一大坨再吐”
                 for chunk in resp.iter_content(chunk_size=1024):
+                    if stop_event.is_set():
+                        break
                     if chunk:
-                        yield chunk
+                        put_blocking(chunk)
 
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n".encode("utf-8")
+            put_blocking(f"data: {json.dumps({'error': str(e)})}\n\n".encode("utf-8"))
+        finally:
+            # 尽量通知结束
+            try:
+                q.put_nowait(END)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=upstream_reader, daemon=True)
+    t.start()
+
+    def make_ping() -> bytes:
+        # SSE 注释行，不会影响 data: JSON 的解析
+        # 做大一点（>=2KB）更容易穿透网关缓冲
+        payload_len = max(0, SSE_PING_BYTES - len(b": ping\n\n"))
+        return b": ping " + (b" " * payload_len) + b"\n\n"
+
+    def generate_stream():
+        try:
+            # 先吐一口，保证“首字节”尽快到客户端，避免被认为没响应
+            yield make_ping()
+
+            while True:
+                try:
+                    item = q.get(timeout=SSE_PING_INTERVAL)
+                except queue.Empty:
+                    # 上游没数据也要定时心跳，防 120s 断连
+                    yield make_ping()
+                    continue
+
+                if item == END:
+                    break
+
+                yield item
+
+        except GeneratorExit:
+            # 客户端断开
+            raise
+        finally:
+            stop_event.set()
 
     r = Response(stream_with_context(generate_stream()), content_type="text/event-stream; charset=utf-8")
-    # SSE 常用头，减少中间层缓存/缓冲导致的“看起来像断流”
-    r.headers["Cache-Control"] = "no-cache"
+    r.headers["Cache-Control"] = "no-cache, no-transform"
     r.headers["Connection"] = "keep-alive"
     r.headers["X-Accel-Buffering"] = "no"
     r.headers["Access-Control-Allow-Origin"] = "*"
     r.headers["Access-Control-Allow-Headers"] = "*"
     return r
+    # ========= 核心改动结束 =========
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
