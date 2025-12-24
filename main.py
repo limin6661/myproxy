@@ -1,189 +1,350 @@
-from flask import Flask, request, Response, stream_with_context
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "curl_cffi",
+#     "flask",
+#     "gevent",
+# ]
+# ///
+
+from flask import Flask, request, Response, stream_with_context, jsonify
 from curl_cffi import requests
 import json
-import os
 import time
-import threading
-import queue
+import os
 
 app = Flask(__name__)
 
-TARGET_URL = "https://api.kimi.com/coding/v1/chat/completions"
+# ================= 基础配置 =================
+LOG_FILE = "traffic.log"
+PORT = int(os.getenv("PORT", "8000"))
 
-BASE_HEADERS = {
-    "Host": "api.kimi.com",
-    "Connection": "keep-alive",
-    "Accept": "application/json",
-    "Accept-Encoding": "identity",
-    "Accept-Language": "*",
-    "Sec-Fetch-Mode": "cors",
-    "X-Stainless-Retry-Count": "0",
-    "X-Stainless-Lang": "js",
-    "X-Stainless-Package-Version": "5.12.2",
-    "X-Stainless-Os": "Windows",
-    "X-Stainless-Arch": "x64",
-    "X-Stainless-Runtime": "node",
-    "X-Stainless-Runtime-Version": "v22.21.1",
-    "Http-Referer": "https://github.com/RooVetGit/Roo-Cline",
-    "X-Title": "Roo Code",
-    "User-Agent": "RooCode/3.36.6",
-    "Content-Type": "application/json",
+# 统一：只做“Authorization 透传”，不在服务器端保存任何 Key
+# 你在 Cherry Studio / ChatBox / Roo Code 里，仍然按 OpenAI 兼容模式，把 Key 放到 Authorization 里即可。
+
+# ============== Provider 配置（可继续扩展）==============
+PROVIDERS = {
+    "kimi": {
+        "name": "Kimi For Coding",
+        # 官方文档给的 Entrypoint 是 https://api.kimi.com/coding/v1
+        # OpenAI 兼容模式下 chat completions 路径就是 /chat/completions
+        "url": "https://api.kimi.com/coding/v1/chat/completions",
+        "default_model": "kimi-for-coding",
+        "base_headers": {
+            "Host": "api.kimi.com",
+            "Connection": "keep-alive",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "X-Stainless-Retry-Count": "0",
+            "X-Stainless-Lang": "js",
+            "X-Stainless-Package-Version": "5.12.2",
+            "X-Stainless-Os": "Windows",
+            "X-Stainless-Arch": "x64",
+            "X-Stainless-Runtime": "node",
+            "X-Stainless-Runtime-Version": "v22.21.1",
+            "Http-Referer": "https://github.com/RooVetGit/Roo-Cline",
+            "X-Title": "Roo Code",
+            "User-Agent": "RooCode/3.36.6",
+            "Content-Type": "application/json",
+        },
+    },
+    "bigmodel": {
+        "name": "Zhipu BigModel (Coding Plan)",
+        # Coding 套餐的 base 是 /api/coding/paas/v4 （不是通用 /api/paas/v4）
+        # chat completions 路径是 /chat/completions
+        "url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+        "default_model": "glm-4.7",
+        "base_headers": {
+            "Host": "open.bigmodel.cn",
+            "Connection": "keep-alive",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        },
+    },
 }
 
-# ===== 关键：心跳配置（可用环境变量覆盖）=====
-SSE_PING_INTERVAL = float(os.environ.get("SSE_PING_INTERVAL", "15"))  # 秒
-# 很多网关会缓冲“小包”，2KB+ 更容易被立刻刷出去
-SSE_PING_BYTES = int(os.environ.get("SSE_PING_BYTES", "2048"))
-STREAM_QUEUE_MAX = int(os.environ.get("STREAM_QUEUE_MAX", "256"))  # 防止断连后堆内存
-
-@app.route("/", methods=["GET"])
-def index():
-    return "Kimi Proxy is Running!"
-
-def pick_max_tokens(client_data: dict) -> int:
-    v = (
-        client_data.get("max_tokens")
-        or client_data.get("max_completion_tokens")
-        or client_data.get("max_output_tokens")
-        or client_data.get("max_new_tokens")
-    )
-    if v is None:
-        return int(os.environ.get("DEFAULT_MAX_TOKENS", "32000"))
+# ================= 工具函数 =================
+def write_log(tag, content):
+    timestamp = time.strftime("%H:%M:%S", time.localtime())
+    line = f"[{timestamp}] [{tag}] {content}"
+    print(line[:300])
     try:
-        return int(v)
-    except Exception:
-        return int(os.environ.get("DEFAULT_MAX_TOKENS", "32000"))
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except:
+        pass
+
+
+def cors_headers():
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+    }
+
+
+def detect_provider(model_name: str) -> str:
+    """
+    你想要的“多层识别”核心就在这里：
+    - 包含 glm / zhipu / bigmodel / zai 之类关键词 => 走智谱 BigModel
+    - 包含 kimi / moonshot 之类关键词 => 走 Kimi
+    - 都不命中 => 报错，让你显式指定
+    """
+    m = (model_name or "").strip().lower()
+
+    # 第一层：明确识别 GLM
+    if any(k in m for k in ["glm", "zhipu", "bigmodel", "z.ai", "zai"]):
+        return "bigmodel"
+
+    # 第二层：识别 Kimi
+    if any(k in m for k in ["kimi", "moonshot"]):
+        return "kimi"
+
+    return ""
+
+
+def choose_upstream_model(provider_key: str, client_model: str) -> str:
+    """
+    - 如果客户端传了明确型号，比如 glm-4.6 / glm-4.7 / kimi-for-coding，就尽量原样使用
+    - 如果只是传了 glm / kimi 这种路由关键词，就落到 default_model
+    """
+    m = (client_model or "").strip()
+    if not m:
+        return PROVIDERS[provider_key]["default_model"]
+
+    ml = m.lower()
+
+    if provider_key == "bigmodel":
+        # 用户只写 glm，也给他兜底到 glm-4.7
+        if ml in ["glm", "zhipu", "bigmodel", "zai", "z.ai"]:
+            return PROVIDERS[provider_key]["default_model"]
+        return m
+
+    if provider_key == "kimi":
+        # 用户只写 kimi，也兜底到 kimi-for-coding
+        if ml in ["kimi", "moonshot", "kimi-for-coding"]:
+            return "kimi-for-coding"
+        # 如果用户写了 kimi-xxx，也尊重
+        return m
+
+    return m
+
+
+def build_payload(provider_key: str, client_data: dict) -> dict:
+    """
+    这里做“尽量 OpenAI 兼容”的转发：
+    - 保留 messages / stream / temperature / max_tokens 等常用字段
+    - 按不同厂家，补齐或改写少量关键字段
+    """
+    messages = client_data.get("messages", [])
+    client_model_name = (client_data.get("model", "") or "").lower()
+
+    stream = bool(client_data.get("stream", True))
+
+    payload = {
+        "model": "",  # 下面填
+        "messages": messages,
+        "stream": stream,
+    }
+
+    # 常见参数：能带就带
+    for k in [
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+        "tools",
+        "tool_choice",
+        "response_format",
+    ]:
+        if k in client_data:
+            payload[k] = client_data[k]
+
+    # 给 max_tokens 一个更友好的默认值
+    if "max_tokens" not in payload:
+        payload["max_tokens"] = 32000
+
+    # 是否“推理模式”的开关：沿用你原来的规则
+    want_think = ("think" in client_model_name) or ("reason" in client_model_name)
+
+    if provider_key == "kimi":
+        payload["model"] = choose_upstream_model("kimi", client_data.get("model", ""))
+        if want_think:
+            write_log("MODE", "kimi => 已激活 reasoning_effort=high")
+            payload["reasoning_effort"] = "high"
+            # 推理更稳一点，稍微放开随机性也行，你也可以删掉这一行
+            payload["temperature"] = float(client_data.get("temperature", 1.0))
+        else:
+            write_log("MODE", "kimi => 普通模式")
+            # 普通模式时，尽量不要夹带 reasoning_effort
+            payload.pop("reasoning_effort", None)
+
+        return payload
+
+    if provider_key == "bigmodel":
+        payload["model"] = choose_upstream_model("bigmodel", client_data.get("model", ""))
+        if want_think:
+            write_log("MODE", "bigmodel => thinking.type=enabled")
+            payload["thinking"] = {"type": "enabled", "clear_thinking": True}
+            # 可选：你也可以在推理时固定更确定的生成
+            # payload["do_sample"] = False
+        else:
+            write_log("MODE", "bigmodel => thinking.type=disabled")
+            payload["thinking"] = {"type": "disabled", "clear_thinking": True}
+        return payload
+
+    return payload
+
+
+# ================= 路由 =================
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True}), 200
+
 
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def proxy_handler():
+    # 1) CORS 预检
     if request.method == "OPTIONS":
-        return Response(
-            status=204,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Allow-Methods": "POST, OPTIONS",
-            },
-        )
+        return Response(status=204, headers=cors_headers())
 
+    # 2) 取 Authorization，原样透传
     client_auth = request.headers.get("Authorization")
     if not client_auth:
-        return json.dumps({"error": "Missing API Key"}), 401
+        return Response(
+            json.dumps({"error": "Missing API Key in Authorization header"}, ensure_ascii=False),
+            status=401,
+            content_type="application/json",
+            headers=cors_headers(),
+        )
 
+    # 3) 解析 JSON
     try:
         client_data = request.get_json(force=True)
         messages = client_data.get("messages", [])
-        client_model_name = (client_data.get("model", "kimi") or "kimi").lower()
-    except Exception:
-        return "Invalid JSON", 400
+        model_name = client_data.get("model", "")
 
-    upstream_headers = BASE_HEADERS.copy()
+        # 记录第一条 user 消息
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                write_log("USER_ASK", msg.get("content", "")[:5000])
+                break
+
+    except Exception as e:
+        write_log("BAD_JSON", str(e))
+        return Response(
+            json.dumps({"error": "Invalid JSON"}, ensure_ascii=False),
+            status=400,
+            content_type="application/json",
+            headers=cors_headers(),
+        )
+
+    # 4) 识别 Provider 并分发
+    provider_key = detect_provider(model_name)
+    if not provider_key:
+        return Response(
+            json.dumps(
+                {
+                    "error": "Unsupported model/provider. Put 'kimi' or 'glm' keyword in model name to route.",
+                    "example": {"model": "kimi-for-coding  或  glm-4.7"},
+                },
+                ensure_ascii=False,
+            ),
+            status=400,
+            content_type="application/json",
+            headers=cors_headers(),
+        )
+
+    provider = PROVIDERS[provider_key]
+    upstream_url = provider["url"]
+
+    # 5) 组装 headers + payload
+    upstream_headers = provider["base_headers"].copy()
     upstream_headers["Authorization"] = client_auth
 
-    request_payload = {
-        "model": "kimi-for-coding",
-        "messages": messages,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "temperature": client_data.get("temperature", 0.7),
-        "max_tokens": pick_max_tokens(client_data),
-    }
+    payload = build_payload(provider_key, client_data)
 
-    for k in ("top_p", "presence_penalty", "frequency_penalty", "stop", "seed", "n"):
-        if k in client_data:
-            request_payload[k] = client_data[k]
-
-    if "think" in client_model_name or "reason" in client_model_name:
-        request_payload["reasoning_effort"] = "high"
-        request_payload["temperature"] = 1.0
-
-    # ========= 核心改动开始：后台读上游 + 前台心跳 =========
-    stop_event = threading.Event()
-    q: queue.Queue[bytes] = queue.Queue(maxsize=STREAM_QUEUE_MAX)
-    END = b"__END__"
-
-    def put_blocking(data: bytes):
-        # 队列满就等，但要能响应 stop_event，避免断连后无限堆内存/卡死
-        while not stop_event.is_set():
-            try:
-                q.put(data, timeout=1)
-                return
-            except queue.Full:
-                continue
-
-    def upstream_reader():
-        try:
-            with requests.Session() as session:
-                resp = session.post(
-                    TARGET_URL,
-                    headers=upstream_headers,
-                    json=request_payload,
-                    impersonate="chrome110",
-                    stream=True,
-                    timeout=3600,
-                )
-
-                if resp.status_code != 200:
-                    put_blocking(f"data: {json.dumps({'error': resp.text})}\n\n".encode("utf-8"))
-                    return
-
-                for chunk in resp.iter_content(chunk_size=1024):
-                    if stop_event.is_set():
-                        break
-                    if chunk:
-                        put_blocking(chunk)
-
-        except Exception as e:
-            put_blocking(f"data: {json.dumps({'error': str(e)})}\n\n".encode("utf-8"))
-        finally:
-            # 尽量通知结束
-            try:
-                q.put_nowait(END)
-            except Exception:
-                pass
-
-    t = threading.Thread(target=upstream_reader, daemon=True)
-    t.start()
-
-    def make_ping() -> bytes:
-        # SSE 注释行，不会影响 data: JSON 的解析
-        # 做大一点（>=2KB）更容易穿透网关缓冲
-        payload_len = max(0, SSE_PING_BYTES - len(b": ping\n\n"))
-        return b": ping " + (b" " * payload_len) + b"\n\n"
+    # 6) 发起请求并透传流
+    client_wants_stream = bool(payload.get("stream", True))
 
     def generate_stream():
         try:
-            # 先吐一口，保证“首字节”尽快到客户端，避免被认为没响应
-            yield make_ping()
+            with requests.Session() as session:
+                resp = session.post(
+                    upstream_url,
+                    headers=upstream_headers,
+                    json=payload,
+                    impersonate="chrome110",
+                    stream=True,
+                    # 给长输出更宽松的超时，避免 120s 直接掐断
+                    timeout=600,
+                )
 
-            while True:
-                try:
-                    item = q.get(timeout=SSE_PING_INTERVAL)
-                except queue.Empty:
-                    # 上游没数据也要定时心跳，防 120s 断连
-                    yield make_ping()
-                    continue
+                if resp.status_code != 200:
+                    err_text = resp.text
+                    write_log("UPSTREAM_ERR", f"{provider['name']} {resp.status_code}: {err_text[:2000]}")
 
-                if item == END:
-                    break
+                    if client_wants_stream:
+                        # SSE 形式把错误推回去
+                        msg = f"data: {json.dumps({'error': err_text}, ensure_ascii=False)}\n\n"
+                        yield msg.encode("utf-8")
+                    else:
+                        yield err_text.encode("utf-8")
+                    return
 
-                yield item
+                write_log("CONN", f"UPSTREAM OK => {provider['name']}")
 
-        except GeneratorExit:
-            # 客户端断开
-            raise
-        finally:
-            stop_event.set()
+                # 原样转发上游 chunk（上游本身就是 SSE 时，这里也是 SSE）
+                for chunk in resp.iter_content(chunk_size=None):
+                    if chunk:
+                        yield chunk
 
-    r = Response(stream_with_context(generate_stream()), content_type="text/event-stream; charset=utf-8")
-    r.headers["Cache-Control"] = "no-cache, no-transform"
-    r.headers["Connection"] = "keep-alive"
-    r.headers["X-Accel-Buffering"] = "no"
-    r.headers["Access-Control-Allow-Origin"] = "*"
-    r.headers["Access-Control-Allow-Headers"] = "*"
-    return r
-    # ========= 核心改动结束 =========
+        except Exception as e:
+            write_log("EXC", str(e))
+            if client_wants_stream:
+                msg = f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+                yield msg.encode("utf-8")
+            else:
+                yield json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8")
 
+    # 7) 返回
+    if client_wants_stream:
+        return Response(
+            stream_with_context(generate_stream()),
+            content_type="text/event-stream",
+            headers=cors_headers(),
+        )
+    else:
+        # 非流式：也走同一条 generate_stream，但 content-type 改成 json
+        return Response(
+            stream_with_context(generate_stream()),
+            content_type="application/json",
+            headers=cors_headers(),
+        )
+
+
+# ================= 启动 =================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    if os.path.exists(LOG_FILE):
+        try:
+            os.remove(LOG_FILE)
+        except:
+            pass
+
+    write_log("BOOT", "安全代理已启动：按 model 自动分发 Kimi / BigModel（Key 透传）")
+    write_log("BOOT", "入口: http://0.0.0.0:%d/v1/chat/completions" % PORT)
+
+    # gevent 对流式转发更稳一些，你依赖里本来就带了它
+    try:
+        from gevent.pywsgi import WSGIServer
+
+        http_server = WSGIServer(("0.0.0.0", PORT), app)
+        http_server.serve_forever()
+    except Exception as e:
+        write_log("BOOT_WARN", f"gevent 启动失败，回退到 Flask 内置服务器: {e}")
+        app.run(host="0.0.0.0", port=PORT, threaded=True)
