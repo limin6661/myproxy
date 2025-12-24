@@ -13,11 +13,18 @@ import json
 import time
 import os
 
+# ====== 新增：心跳保活所需 ======
+import threading
+import queue
+
 app = Flask(__name__)
 
 # ================= 基础配置 =================
 LOG_FILE = "traffic.log"
 PORT = int(os.getenv("PORT", "8000"))
+
+# ====== 新增：心跳间隔（秒），建议 5~15，越小越稳但更“吵” ======
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "10"))
 
 # 统一：只做“Authorization 透传”，不在服务器端保存任何 Key
 # 你在 Cherry Studio / ChatBox / Roo Code 里，仍然按 OpenAI 兼容模式，把 Key 放到 Authorization 里即可。
@@ -272,52 +279,129 @@ def proxy_handler():
     # 6) 发起请求并透传流
     client_wants_stream = bool(payload.get("stream", True))
 
+    # ====== 新增：SSE 心跳（注释行，标准 SSE 客户端会忽略，但能让链路“有字节流动”） ======
+    def sse_heartbeat_bytes():
+        # 加上时间戳，避免某些中间层把重复小包合并/优化掉
+        return f": ping {int(time.time())}\n\n".encode("utf-8")
+
     def generate_stream():
-        try:
-            with requests.Session() as session:
-                resp = session.post(
-                    upstream_url,
-                    headers=upstream_headers,
-                    json=payload,
-                    impersonate="chrome110",
-                    stream=True,
-                    # 给长输出更宽松的超时，避免 120s 直接掐断
-                    timeout=600,
-                )
+        """
+        这里保持你原来的结构，只做“必要修改”：
+        - 用后台线程读取上游数据放入队列
+        - 主生成器每隔 HEARTBEAT_INTERVAL 秒，若队列没数据，就吐一个 SSE 心跳
+        这样即使上游 400~900 秒不吐 token，连接也不会因为“无输出”被掐断
+        """
+        # 非流式：维持你原来的行为（不引入心跳，避免破坏 JSON）
+        if not client_wants_stream:
+            try:
+                with requests.Session() as session:
+                    resp = session.post(
+                        upstream_url,
+                        headers=upstream_headers,
+                        json=payload,
+                        impersonate="chrome110",
+                        stream=True,
+                        timeout=600,
+                    )
 
-                if resp.status_code != 200:
-                    err_text = resp.text
-                    write_log("UPSTREAM_ERR", f"{provider['name']} {resp.status_code}: {err_text[:2000]}")
-
-                    if client_wants_stream:
-                        # SSE 形式把错误推回去
-                        msg = f"data: {json.dumps({'error': err_text}, ensure_ascii=False)}\n\n"
-                        yield msg.encode("utf-8")
-                    else:
+                    if resp.status_code != 200:
+                        err_text = resp.text
+                        write_log("UPSTREAM_ERR", f"{provider['name']} {resp.status_code}: {err_text[:2000]}")
                         yield err_text.encode("utf-8")
-                    return
+                        return
 
-                write_log("CONN", f"UPSTREAM OK => {provider['name']}")
-
-                # 原样转发上游 chunk（上游本身就是 SSE 时，这里也是 SSE）
-                for chunk in resp.iter_content(chunk_size=None):
-                    if chunk:
-                        yield chunk
-
-        except Exception as e:
-            write_log("EXC", str(e))
-            if client_wants_stream:
-                msg = f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
-                yield msg.encode("utf-8")
-            else:
+                    write_log("CONN", f"UPSTREAM OK => {provider['name']}")
+                    for chunk in resp.iter_content(chunk_size=None):
+                        if chunk:
+                            yield chunk
+            except Exception as e:
+                write_log("EXC", str(e))
                 yield json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8")
+            return
+
+        # ====== 流式：启用“队列 + 心跳” ======
+        q: "queue.Queue[object]" = queue.Queue()
+        done = threading.Event()
+
+        def reader_thread():
+            try:
+                with requests.Session() as session:
+                    resp = session.post(
+                        upstream_url,
+                        headers=upstream_headers,
+                        json=payload,
+                        impersonate="chrome110",
+                        stream=True,
+                        # 你原来的超时保留
+                        timeout=600,
+                    )
+
+                    if resp.status_code != 200:
+                        err_text = resp.text
+                        write_log("UPSTREAM_ERR", f"{provider['name']} {resp.status_code}: {err_text[:2000]}")
+                        q.put(("err", err_text))
+                        return
+
+                    write_log("CONN", f"UPSTREAM OK => {provider['name']}")
+
+                    for chunk in resp.iter_content(chunk_size=None):
+                        if chunk:
+                            q.put(("data", chunk))
+
+            except Exception as e:
+                write_log("EXC", str(e))
+                q.put(("exc", str(e)))
+            finally:
+                done.set()
+                q.put(("eof", None))
+
+        threading.Thread(target=reader_thread, daemon=True).start()
+
+        saw_any_data = False
+
+        while True:
+            try:
+                item = q.get(timeout=HEARTBEAT_INTERVAL)
+            except queue.Empty:
+                # 上游在“深度思考”阶段一字不出时，靠这个心跳保活
+                yield sse_heartbeat_bytes()
+                continue
+
+            kind, val = item
+
+            if kind == "data":
+                saw_any_data = True
+                yield val
+                continue
+
+            if kind == "err":
+                # 用 SSE 形式把错误推回去，并结束
+                msg = f"data: {json.dumps({'error': val}, ensure_ascii=False)}\n\n"
+                yield msg.encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                break
+
+            if kind == "exc":
+                msg = f"data: {json.dumps({'error': val}, ensure_ascii=False)}\n\n"
+                yield msg.encode("utf-8")
+                yield b"data: [DONE]\n\n"
+                break
+
+            if kind == "eof":
+                # 正常结束：上游通常已经发了 [DONE]，这里不强行补，避免重复
+                break
 
     # 7) 返回
     if client_wants_stream:
+        h = cors_headers()
+        # ====== 新增：尽量让中间层别缓冲 SSE ======
+        h["Cache-Control"] = "no-cache, no-transform"
+        h["X-Accel-Buffering"] = "no"
+
         return Response(
             stream_with_context(generate_stream()),
             content_type="text/event-stream",
-            headers=cors_headers(),
+            headers=h,
         )
     else:
         # 非流式：也走同一条 generate_stream，但 content-type 改成 json
