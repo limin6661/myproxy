@@ -281,8 +281,13 @@ def proxy_handler():
 
     # ====== 新增：SSE 心跳（注释行，标准 SSE 客户端会忽略，但能让链路“有字节流动”） ======
     def sse_heartbeat_bytes():
-        # 加上时间戳，避免某些中间层把重复小包合并/优化掉
-        return f": ping {int(time.time())}\n\n".encode("utf-8")
+        # 发一个“合法的 data: …”空增量，客户端更容易认可为“有响应”
+        payload = {"choices": [{"delta": {}}]}
+        s = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        # 适当填充，避免中间层攒小包
+        if len(s) < 2048:
+            s = s + (" " * (2048 - len(s)))
+        return s.encode("utf-8")
 
     def generate_stream():
         """
@@ -358,7 +363,8 @@ def proxy_handler():
         threading.Thread(target=reader_thread, daemon=True).start()
 
         saw_any_data = False
-
+        
+        yield sse_heartbeat_bytes()
         while True:
             try:
                 item = q.get(timeout=HEARTBEAT_INTERVAL)
