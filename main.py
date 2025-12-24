@@ -167,7 +167,7 @@ def build_payload(provider_key: str, client_data: dict) -> dict:
 
     # 给 max_tokens 一个更友好的默认值
     if "max_tokens" not in payload:
-        payload["max_tokens"] = 32000
+        payload["max_tokens"] = 1024 * 32
 
     # 是否“推理模式”的开关：沿用你原来的规则
     want_think = ("think" in client_model_name) or ("reason" in client_model_name)
